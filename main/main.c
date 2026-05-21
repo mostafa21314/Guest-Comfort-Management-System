@@ -42,9 +42,10 @@ static TickType_t fb_token_obtained_at = 0;
 // ── Pin definitions ───────────────────────────────────────────────────────────
 #define DHT_PIN         GPIO_NUM_26
 #define PIR_PIN         GPIO_NUM_25
-#define IR_OUTER_PIN    GPIO_NUM_13
-#define IR_INNER_PIN    GPIO_NUM_14
-#define RELAY_PIN       GPIO_NUM_23
+#define IR_OUTER_PIN    GPIO_NUM_13   // outer receiver (outside the door)
+#define IR_INNER_PIN    GPIO_NUM_14   // inner receiver (inside the door)
+#define RELAY_PIN       GPIO_NUM_23   // relay IN1 — active LOW
+#define ATOMIZER_PIN    GPIO_NUM_21   // ultrasonic atomizer control (HIGH = on)
 
 // ── Timing ────────────────────────────────────────────────────────────────────
 #define POLL_PERIOD_MS          10
@@ -81,6 +82,23 @@ static const char FIREBASE_ROOT_CA[] =
     "DKqC5JlR3XC321Y9YeRq4VzW9v493kHMB65jUr9TU/Qr6cf9tveCX4XSQRjbgbME\n"
     "HMUfpIBvFSDJ3gyICh3WZlXi/EjJKSZp4A==\n"
     "-----END CERTIFICATE-----\n";
+
+
+static void relay_set(bool on)
+{
+    // Most relay modules are active LOW: LOW = relay energized = lamp ON
+    gpio_set_level(RELAY_PIN, on ? 0 : 1);
+    ESP_LOGI("relay", "Lamp %s", on ? "ON" : "OFF");
+}
+
+// Atomizer behaves like a momentary push button: one HIGH pulse toggles its state.
+static void atomizer_press(void)
+{
+    gpio_set_level(ATOMIZER_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    gpio_set_level(ATOMIZER_PIN, 0);
+    ESP_LOGI("atomizer", "button pressed");
+}
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 static EventGroupHandle_t wifi_event_group;
@@ -493,6 +511,7 @@ static void detection_poll(void)
                     room_occupied = false;
                     pub_room("EMPTY");
                     relay_set(false);
+                    atomizer_press();   // toggle atomizer OFF
                 }
                 ESP_LOGI(TAG, "<<< EXIT (people: %d)", people_count);
                 last_detection_at = now;
@@ -512,6 +531,7 @@ static void detection_poll(void)
                     room_occupied = true;
                     pub_room("OCCUPIED");
                     relay_set(true);
+                    atomizer_press();   // toggle atomizer ON
                 }
                 ESP_LOGI(TAG, ">>> ENTRANCE confirmed (people: %d)", people_count);
                 last_detection_at = now;
@@ -593,9 +613,18 @@ void app_main(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&relay_cfg);
-    relay_set(true);                        // self-test flash
-    vTaskDelay(pdMS_TO_TICKS(500));
     relay_set(false);
+
+    // Atomizer — assumed OFF at boot, pulses toggle its state
+    gpio_config_t atomizer_cfg = {
+        .pin_bit_mask = (1ULL << ATOMIZER_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&atomizer_cfg);
+    gpio_set_level(ATOMIZER_PIN, 0);
 
     // PIR
     gpio_config_t pir_cfg = {
