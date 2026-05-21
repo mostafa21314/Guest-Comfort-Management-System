@@ -1,4 +1,4 @@
-# Guest-Comfort-Management-System
+# Smart-Home-Control-System
 
 An embedded systems project that monitors room occupancy, temperature, and humidity, publishing all data over MQTT via WiFi. Built with ESP-IDF on an ESP32.
 
