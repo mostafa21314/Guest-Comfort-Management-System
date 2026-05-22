@@ -15,6 +15,7 @@
 #include "esp_tls.h"
 #include "esp_http_client.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_rom_sys.h"
 #include "soc/gpio_reg.h"
 #include "secrets.h"
@@ -46,6 +47,9 @@ static TickType_t fb_token_obtained_at = 0;
 #define IR_INNER_PIN    GPIO_NUM_14   // inner receiver (inside the door)
 #define RELAY_PIN       GPIO_NUM_23   // relay IN1 — active LOW
 #define ATOMIZER_PIN    GPIO_NUM_21   // ultrasonic atomizer control (HIGH = on)
+#define DFPLAYER_TX_PIN GPIO_NUM_17   // ESP32 TX → DFPlayer RX (avoid GPIO 2 — strapping pin)
+#define DFPLAYER_UART   UART_NUM_2
+#define DFPLAYER_BAUD   9600
 
 // ── Timing ────────────────────────────────────────────────────────────────────
 #define POLL_PERIOD_MS          10
@@ -83,6 +87,10 @@ static const char FIREBASE_ROOT_CA[] =
     "HMUfpIBvFSDJ3gyICh3WZlXi/EjJKSZp4A==\n"
     "-----END CERTIFICATE-----\n";
 
+
+// Forward decls — DFPlayer helpers are defined further down so detection_poll() can call them.
+static void dfplayer_play(uint16_t track);
+static void dfplayer_stop(void);
 
 static void relay_set(bool on)
 {
@@ -126,14 +134,6 @@ static bool outer_broken = false, inner_broken = false;
 static int  outer_hi = 0, outer_lo = 0;
 static int  inner_hi = 0, inner_lo = 0;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Relay
-// ─────────────────────────────────────────────────────────────────────────────
-static void relay_set(bool on)
-{
-    gpio_set_level(RELAY_PIN, on ? 1 : 0);
-    ESP_LOGI("relay", "Lamp %s", on ? "ON" : "OFF");
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DHT22 bit-bang driver (unchanged — timing-critical, no HAL)
@@ -512,6 +512,7 @@ static void detection_poll(void)
                     pub_room("EMPTY");
                     relay_set(false);
                     atomizer_press();   // toggle atomizer OFF
+                    dfplayer_stop();    // silence welcome track
                 }
                 ESP_LOGI(TAG, "<<< EXIT (people: %d)", people_count);
                 last_detection_at = now;
@@ -532,6 +533,7 @@ static void detection_poll(void)
                     pub_room("OCCUPIED");
                     relay_set(true);
                     atomizer_press();   // toggle atomizer ON
+                    dfplayer_play(1);   // welcome track
                 }
                 ESP_LOGI(TAG, ">>> ENTRANCE confirmed (people: %d)", people_count);
                 last_detection_at = now;
@@ -592,6 +594,71 @@ static void wifi_init(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DFPlayer Mini — one-way UART control (ESP32 TX only; RX of module not used)
+// Protocol: 10-byte frame  7E FF 06 CMD 00 paramH paramL checkH checkL EF
+// Checksum = 0 - sum(bytes 1..6) as a 16-bit value.
+// ─────────────────────────────────────────────────────────────────────────────
+static void dfplayer_send_cmd(uint8_t cmd, uint16_t param)
+{
+    uint8_t f[10];
+    f[0] = 0x7E;
+    f[1] = 0xFF;
+    f[2] = 0x06;
+    f[3] = cmd;
+    f[4] = 0x00;                       // no feedback requested
+    f[5] = (param >> 8) & 0xFF;
+    f[6] = param & 0xFF;
+    uint16_t sum = 0;
+    for (int i = 1; i <= 6; i++) sum += f[i];
+    uint16_t chk = 0 - sum;
+    f[7] = (chk >> 8) & 0xFF;
+    f[8] = chk & 0xFF;
+    f[9] = 0xEF;
+    uart_write_bytes(DFPLAYER_UART, (const char *)f, sizeof(f));
+}
+
+static void dfplayer_init(void)
+{
+    uart_config_t cfg = {
+        .baud_rate  = DFPLAYER_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(DFPLAYER_UART, 256, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(DFPLAYER_UART, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(DFPLAYER_UART,
+                                 DFPLAYER_TX_PIN,
+                                 UART_PIN_NO_CHANGE,    // RX unused
+                                 UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE));
+
+    // Module needs ~1.5–2 s after power-up before it accepts commands
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    dfplayer_send_cmd(0x06, 20);       // volume 0..30
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI("dfplayer", "init done (UART%d, TX=GPIO%d)",
+             DFPLAYER_UART, DFPLAYER_TX_PIN);
+}
+
+// Play the Nth file in physical write order on the SD root
+// (i.e. the first MP3 you copied is track 1). Use 0x12 + folder "mp3/0001.mp3"
+// instead if you want index-by-filename behavior.
+static void dfplayer_play(uint16_t track)
+{
+    dfplayer_send_cmd(0x03, track);
+    ESP_LOGI("dfplayer", "play track %u", track);
+}
+
+static void dfplayer_stop(void)
+{
+    dfplayer_send_cmd(0x16, 0);
+    ESP_LOGI("dfplayer", "stop");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 void app_main(void)
@@ -649,6 +716,7 @@ void app_main(void)
     wifi_init();
     esp_wifi_set_ps(WIFI_PS_NONE);   // disable radio sleep — prevents TLS timeout failures
     firebase_signin_anonymous();
+    dfplayer_init();
     ESP_LOGI(TAG, "System ready.");
 
     TickType_t last_dht_tick     = xTaskGetTickCount();
