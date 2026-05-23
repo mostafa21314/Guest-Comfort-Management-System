@@ -18,7 +18,21 @@
 #include "driver/uart.h"
 #include "esp_rom_sys.h"
 #include "soc/gpio_reg.h"
+#include "driver/rmt_tx.h"
+#include "driver/rmt_rx.h"
 #include "secrets.h"
+
+// ── IR AC Control ─────────────────────────────────────────────────────────────
+#define IR_TX_GPIO  GPIO_NUM_19
+#define IR_TX_CHANNEL RMT_TX_CHANNEL_0
+static rmt_channel_handle_t ir_tx_handle = NULL;
+static uint32_t ac_ir_codes[16] = {0};  // Store up to 16 different AC codes
+
+// ── IR Code Capture (temp for learning remote codes) ──────────────────────────
+#define IR_CAPTURE_ENABLED 1   // Set to 0 to disable code capture and resume normal operation
+#define IR_CAPTURE_PIN IR_OUTER_PIN  // Temporarily use outer receiver to capture codes
+#define IR_RX_CHANNEL RMT_RX_CHANNEL_0
+static rmt_channel_handle_t ir_rx_handle = NULL;
 
 // ── WiFi / Firebase config ────────────────────────────────────────────────────
 #define WIFI_MAX_RETRY  10
@@ -65,6 +79,11 @@ static void dfplayer_stop(void);
 static void relay_set(bool on);
 static void atomizer_press(void);
 static void atomizer_set(bool on);
+static void ir_tx_init(void);
+static void send_ir_nec(uint32_t addr, uint32_t cmd);
+static void handle_ac_command(int temp);
+static void ir_rx_init(void);
+static bool ir_rx_capture(void);
 
 // ── Global state ──────────────────────────────────────────────────────────────
 static volatile bool room_occupied = false;
@@ -407,6 +426,9 @@ static void poll_command(void)
         pub_light(light_on);
         pub_atomizer(atomizer_on);
         pub_music(music_on);
+    } else if (strncmp(cmd, "AC_SET_TEMP:", 12) == 0) {
+        int temp = atoi(cmd + 12);
+        handle_ac_command(temp);
     }
 
     // Clear the command node so it is not processed again
@@ -627,6 +649,114 @@ static void dfplayer_stop(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// IR AC Control
+// ─────────────────────────────────────────────────────────────────────────────
+static void ir_tx_init(void)
+{
+    rmt_tx_channel_config_t tx_cfg = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .gpio_num = IR_TX_GPIO,
+        .mem_block_symbols = 64,
+        .trans_queue_depth = 4,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_cfg, &ir_tx_handle));
+    ESP_ERROR_CHECK(rmt_enable(ir_tx_handle));
+    ESP_LOGI(TAG, "IR TX initialized on GPIO%d", IR_TX_GPIO);
+}
+
+static void send_ir_nec(uint32_t addr, uint32_t cmd)
+{
+    ir_nec_scan_code_t scan_code = {
+        .address = addr,
+        .command = cmd,
+    };
+
+    rmt_transmit_config_t tx_cfg = {
+        .loop_count = 0,
+    };
+
+    rmt_encoder_handle_t nec_encoder;
+    ir_nec_encoder_config_t nec_cfg = {
+        .flags.msb_first = 1,
+    };
+
+    ESP_ERROR_CHECK(rmt_new_ir_nec_encoder(&nec_cfg, &nec_encoder));
+    ESP_ERROR_CHECK(rmt_transmit(ir_tx_handle, nec_encoder, &scan_code, &tx_cfg));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_ERROR_CHECK(rmt_encoder_reset(nec_encoder));
+    ESP_LOGI(TAG, "IR sent: addr=0x%02X cmd=0x%02X", addr, cmd);
+}
+
+static void handle_ac_command(int temp)
+{
+    if (temp < 16 || temp > 30) {
+        ESP_LOGW(TAG, "AC temp out of range: %d°C", temp);
+        return;
+    }
+
+    // Map temperature to command code
+    // For your RG56V2/BGEF remote, you'll need to capture actual IR codes
+    // For now, using standard NEC: addr=0x01, cmd=temperature
+    uint32_t cmd = (uint32_t)temp;
+
+    ESP_LOGI(TAG, "AC: setting temperature to %d°C", temp);
+    send_ir_nec(0x01, cmd);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IR RX — Temporary code capture (for learning remote codes)
+// ─────────────────────────────────────────────────────────────────────────────
+static bool ir_rx_ready = false;
+static ir_nec_scan_code_t captured_code = {0, 0};
+static rmt_decoder_handle_t nec_decoder = NULL;
+
+static bool ir_rx_callback(rmt_rx_done_event_data_t *edata, void *user_ctx)
+{
+    rmt_nec_code_t *nec_code = (rmt_nec_code_t *)edata->received_symbols;
+    if (edata->num_symbols > 0) {
+        captured_code.address = nec_code->address;
+        captured_code.command = nec_code->command;
+        ir_rx_ready = true;
+    }
+    return true;
+}
+
+static void ir_rx_init(void)
+{
+    if (!IR_CAPTURE_ENABLED) return;
+
+    rmt_rx_channel_config_t rx_cfg = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .gpio_num = IR_CAPTURE_PIN,
+        .mem_block_symbols = 64,
+    };
+    ESP_ERROR_CHECK(rmt_new_rx_channel(&rx_cfg, &ir_rx_handle));
+
+    ir_nec_decoder_config_t nec_cfg = {.flags.msb_first = 1};
+    ESP_ERROR_CHECK(rmt_new_ir_nec_decoder(&nec_cfg, &nec_decoder));
+
+    rmt_rx_event_callbacks_t cbs = {.on_done = ir_rx_callback};
+    ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(ir_rx_handle, &cbs, NULL));
+    ESP_ERROR_CHECK(rmt_enable(ir_rx_handle));
+    ESP_ERROR_CHECK(rmt_receive(ir_rx_handle, nec_decoder, NULL, -1));
+    ESP_LOGI(TAG, "IR RX (code capture) initialized on GPIO%d", IR_CAPTURE_PIN);
+}
+
+static bool ir_rx_capture(void)
+{
+    if (!IR_CAPTURE_ENABLED || !ir_rx_handle) return false;
+
+    if (ir_rx_ready) {
+        ir_rx_ready = false;
+        ESP_LOGI(TAG, "IR CODE: addr=0x%02X cmd=0x%02X",
+                 captured_code.address, captured_code.command);
+        return true;
+    }
+
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 void app_main(void)
@@ -671,8 +801,32 @@ void app_main(void)
     };
     gpio_config(&pir_cfg);
 
-    // IR
-    ir_init();
+    // IR (receivers for detection) — skip outer if capture is enabled
+    if (!IR_CAPTURE_ENABLED) {
+        ir_init();
+    } else {
+        // Only init inner receiver when capturing with outer
+        gpio_config_t io = {
+            .pin_bit_mask = (1ULL << IR_INNER_PIN),
+            .mode         = GPIO_MODE_INPUT,
+            .pull_up_en   = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io);
+        ESP_LOGI(TAG, "IR: outer receiver in capture mode, inner for detection");
+    }
+
+    // IR (transmitter for AC control)
+    ir_tx_init();
+
+    // IR (receiver code capture for learning remote)
+    if (IR_CAPTURE_ENABLED) {
+        ir_rx_init();
+        ESP_LOGI(TAG, "=== IR CODE CAPTURE MODE ===");
+        ESP_LOGI(TAG, "Press buttons on your remote — codes will be logged to serial");
+    }
+
     vTaskDelay(pdMS_TO_TICKS(200));
 
     ESP_LOGI(TAG, "=== Smart Home — WiFi/Firebase build ===");
@@ -702,14 +856,18 @@ void app_main(void)
 
     TickType_t last_cmd_poll = 0;
     while (1) {
-        // Directional detection (IR + PIR) — every POLL_PERIOD_MS
-        detection_poll();
+        if (IR_CAPTURE_ENABLED) {
+            // Code capture mode: listen for IR signals
+            ir_rx_capture();
+        } else {
+            // Normal operation: detection + Firebase commands
+            detection_poll();
 
-        // Command polling from Firebase — every COMMAND_POLL_MS
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_cmd_poll) >= pdMS_TO_TICKS(COMMAND_POLL_MS)) {
-            poll_command();
-            last_cmd_poll = now;
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_cmd_poll) >= pdMS_TO_TICKS(COMMAND_POLL_MS)) {
+                poll_command();
+                last_cmd_poll = now;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
