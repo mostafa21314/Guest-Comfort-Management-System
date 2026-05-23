@@ -354,7 +354,6 @@ IR CODE: addr=0x01 cmd=0x10
 - Test complete AC control flow end-to-end
 
 ### Future Enhancements
-- [ ] Deploy dashboard to Firebase Hosting
 - [ ] Fine-tune sensor debouncing parameters
 - [ ] Add temperature/humidity chart display to dashboard
 - [ ] Add scheduling/automation features
