@@ -18,27 +18,22 @@
 #include "driver/uart.h"
 #include "esp_rom_sys.h"
 #include "soc/gpio_reg.h"
-#include "secrets.h"
-// ── WiFi credentials ──────────────────────────────────────────────────────────
+// #include "secrets.h"   // disabled — local-only build (no WiFi/Firebase)
+/* ── WiFi / Firebase config — disabled for local-only build ─────────────────
 #define WIFI_MAX_RETRY  10
 
-// ── Firebase configuration ────────────────────────────────────────────────────
-// Replace these with your actual Firebase project values.
-// FIREBASE_HOST    : your Realtime Database URL (no trailing slash, no https://)
-// FIREBASE_API_KEY : your Web API key (used for anonymous sign-in via Identity Toolkit)
 #define FIREBASE_BASE     "/smarthome/room001"
 
-// ── Firebase anonymous-auth token state ──────────────────────────────────────
 static char fb_id_token[1200]         = {0};
 static TickType_t fb_token_obtained_at = 0;
-#define TOKEN_REFRESH_INTERVAL_MS  (55 * 60 * 1000)   // refresh every 55 min
+#define TOKEN_REFRESH_INTERVAL_MS  (55 * 60 * 1000)
 
-// ── Firebase paths ────────────────────────────────────────────────────────────
 #define PATH_TEMP       FIREBASE_BASE "/temperature.json"
 #define PATH_HUM        FIREBASE_BASE "/humidity.json"
 #define PATH_ROOM       FIREBASE_BASE "/room.json"
 #define PATH_COUNT      FIREBASE_BASE "/count.json"
 #define PATH_COMMAND    FIREBASE_BASE "/command.json"
+─────────────────────────────────────────────────────────────────────────── */
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 #define DHT_PIN         GPIO_NUM_26
@@ -61,9 +56,8 @@ static TickType_t fb_token_obtained_at = 0;
 
 static const char *TAG = "SmartHome";
 
-// ── Firebase root CA (Google Trust Services) ──────────────────────────────────
-// This allows esp_http_client to verify the Firebase TLS certificate.
-// Update this cert if it expires (valid until ~2036).
+// ── Firebase root CA — disabled for local-only build ─────────────────────────
+#if 0
 static const char FIREBASE_ROOT_CA[] =
     "-----BEGIN CERTIFICATE-----\n"
     "MIIDdTCCAl2gAwIBAgILBAAAAAABFUtaw5QwDQYJKoZIhvcNAQEFBQAwVzELMAkG\n"
@@ -86,6 +80,7 @@ static const char FIREBASE_ROOT_CA[] =
     "DKqC5JlR3XC321Y9YeRq4VzW9v493kHMB65jUr9TU/Qr6cf9tveCX4XSQRjbgbME\n"
     "HMUfpIBvFSDJ3gyICh3WZlXi/EjJKSZp4A==\n"
     "-----END CERTIFICATE-----\n";
+#endif
 
 
 // Forward decls — DFPlayer helpers are defined further down so detection_poll() can call them.
@@ -102,17 +97,21 @@ static void relay_set(bool on)
 // Atomizer behaves like a momentary push button: one HIGH pulse toggles its state.
 static void atomizer_press(void)
 {
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     gpio_set_level(ATOMIZER_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(500));
     gpio_set_level(ATOMIZER_PIN, 0);
     ESP_LOGI("atomizer", "button pressed");
 }
 
-// ── WiFi ──────────────────────────────────────────────────────────────────────
+// ── WiFi state — disabled for local-only build ───────────────────────────────
+#if 0
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
 static int wifi_retry_count = 0;
+#endif
 
 // ── Global state ──────────────────────────────────────────────────────────────
 static volatile bool room_occupied = false;
@@ -136,8 +135,9 @@ static int  inner_hi = 0, inner_lo = 0;
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DHT22 bit-bang driver (unchanged — timing-critical, no HAL)
+// DHT22 bit-bang driver — disabled for local-only build
 // ─────────────────────────────────────────────────────────────────────────────
+#if 0
 #define _DHT_BIT(p)   (1U << ((p) & 31U))
 #define DHT_READ(p)   (((REG_READ(GPIO_IN_REG))  >> (p)) & 1U)
 #define DHT_HIGH(p)   REG_WRITE(GPIO_OUT_W1TS_REG,  _DHT_BIT(p))
@@ -185,6 +185,7 @@ done:
     DHT_OUTPUT(pin); DHT_HIGH(pin);
     return result;
 }
+#endif  // DHT22 driver disabled
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IR receivers
@@ -213,10 +214,9 @@ static bool debounce_beam(int gpio, int *hi, int *lo, bool *broken)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Firebase HTTP helpers
+// Firebase HTTP helpers — disabled for local-only build
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Shared response buffer — sized for the largest response (anonymous sign-in ~2 KB)
+#if 0
 static char http_response_buf[2048];
 static int  http_response_len = 0;
 
@@ -464,6 +464,7 @@ static void poll_command(void)
     // Clear the command node so it isn't processed again
     firebase_delete(PATH_COMMAND);
 }
+#endif  // Firebase + command polling disabled
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Directional detection (unchanged logic — timing stays on-device)
@@ -492,6 +493,7 @@ static void detection_poll(void)
 
         case DETECT_OUTER_FIRST:
             if ((now - state_entered_at) >= pdMS_TO_TICKS(SEQUENCE_TIMEOUT_MS)) {
+                ESP_LOGI(TAG, "Outer-first timeout — sequence abandoned");
                 detect_state = DETECT_IDLE;
             } else if (inner_just_broke) {
                 detect_state = DETECT_AWAIT_PIR;
@@ -502,17 +504,21 @@ static void detection_poll(void)
 
         case DETECT_INNER_FIRST:
             if ((now - state_entered_at) >= pdMS_TO_TICKS(SEQUENCE_TIMEOUT_MS)) {
+                ESP_LOGI(TAG, "Inner-first timeout — sequence abandoned");
                 detect_state = DETECT_IDLE;
             } else if (outer_just_broke) {
                 // EXIT confirmed
                 people_count = (people_count > 0) ? people_count - 1 : 0;
-                pub_count(people_count);
+                // pub_count(people_count);   // Firebase disabled
                 if (people_count == 0 && room_occupied) {
                     room_occupied = false;
-                    pub_room("EMPTY");
+                    // pub_room("EMPTY");     // Firebase disabled
                     relay_set(false);
-                    atomizer_press();   // toggle atomizer OFF
                     dfplayer_stop();    // silence welcome track
+                    atomizer_press();   // toggle atomizer OFF
+                    atomizer_press();   // toggle atomizer OFF
+
+
                 }
                 ESP_LOGI(TAG, "<<< EXIT (people: %d)", people_count);
                 last_detection_at = now;
@@ -527,15 +533,15 @@ static void detection_poll(void)
             } else if (gpio_get_level(PIR_PIN) == 1) {
                 // ENTRANCE confirmed
                 people_count++;
-                pub_count(people_count);
+                // pub_count(people_count);   // Firebase disabled
                 if (!room_occupied) {
                     room_occupied = true;
-                    pub_room("OCCUPIED");
+                    // pub_room("OCCUPIED");  // Firebase disabled
                     relay_set(true);
                     atomizer_press();   // toggle atomizer ON
                     dfplayer_play(1);   // welcome track
                 }
-                ESP_LOGI(TAG, ">>> ENTRANCE confirmed (people: %d)", people_count);
+                ESP_LOGI(TAG, ">>> ENTRANCE confirmed (People: %d)", people_count);
                 last_detection_at = now;
                 detect_state = DETECT_IDLE;
             }
@@ -544,8 +550,9 @@ static void detection_poll(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WiFi
+// WiFi — disabled for local-only build
 // ─────────────────────────────────────────────────────────────────────────────
+#if 0
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *event_data)
 {
@@ -592,6 +599,7 @@ static void wifi_init(void)
                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                         pdFALSE, pdFALSE, portMAX_DELAY);
 }
+#endif  // WiFi disabled
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DFPlayer Mini — one-way UART control (ESP32 TX only; RX of module not used)
@@ -703,51 +711,28 @@ void app_main(void)
     };
     gpio_config(&pir_cfg);
 
-    // DHT22
-    gpio_set_pull_mode(DHT_PIN, GPIO_PULLUP_ONLY);
-    DHT_OUTPUT(DHT_PIN);
-    DHT_HIGH(DHT_PIN);
+    // DHT22 init — disabled (no temp/humidity in this build)
+    // gpio_set_pull_mode(DHT_PIN, GPIO_PULLUP_ONLY);
+    // DHT_OUTPUT(DHT_PIN);
+    // DHT_HIGH(DHT_PIN);
 
     // IR
     ir_init();
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    ESP_LOGI(TAG, "=== Smart Home — Firebase REST ===");
-    wifi_init();
-    esp_wifi_set_ps(WIFI_PS_NONE);   // disable radio sleep — prevents TLS timeout failures
-    firebase_signin_anonymous();
+    ESP_LOGI(TAG, "=== Smart Home — local-only build (no WiFi/Firebase/DHT) ===");
+    // wifi_init();
+    // esp_wifi_set_ps(WIFI_PS_NONE);
+    // firebase_signin_anonymous();
     dfplayer_init();
     ESP_LOGI(TAG, "System ready.");
 
-    TickType_t last_dht_tick     = xTaskGetTickCount();
-    TickType_t last_command_tick = xTaskGetTickCount();
-
     while (1) {
-        TickType_t now = xTaskGetTickCount();
-
         // ── Directional detection (IR + PIR) — every POLL_PERIOD_MS ──────────
         detection_poll();
 
-        // ── DHT22 — every DHT_INTERVAL_MS ─────────────────────────────────────
-        if ((now - last_dht_tick) >= pdMS_TO_TICKS(DHT_INTERVAL_MS)) {
-            last_dht_tick = now;
-            dht_data_t dht = dht_read(DHT_PIN);
-            if (dht.valid) {
-                pub_temperature(dht.temperature);
-                pub_humidity(dht.humidity);
-                ESP_LOGI(TAG, "Temp: %.1f C | Hum: %.1f %% | Room: %s | Count: %d",
-                         dht.temperature, dht.humidity,
-                         room_occupied ? "OCCUPIED" : "EMPTY", people_count);
-            } else {
-                ESP_LOGW(TAG, "DHT22 read failed (check wiring on GPIO %d)", DHT_PIN);
-            }
-        }
-
-        // ── Command polling — every COMMAND_POLL_MS ───────────────────────────
-        if ((now - last_command_tick) >= pdMS_TO_TICKS(COMMAND_POLL_MS)) {
-            last_command_tick = now;
-            poll_command();
-        }
+        // ── DHT22 + Firebase publish — disabled ───────────────────────────────
+        // ── Command polling (Firebase) — disabled ─────────────────────────────
 
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
     }
