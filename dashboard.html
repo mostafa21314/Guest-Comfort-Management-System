@@ -794,16 +794,42 @@
           </div>
         </div>
         <div class="control-card">
-          <h3>Commands</h3>
+          <h3>Atomizer</h3>
+          <div class="relay-toggle">
+            <label class="toggle-switch">
+              <input
+                type="checkbox"
+                id="atomizerToggle"
+                onchange="
+                  sendCommand(this.checked ? 'ATOMIZER_ON' : 'ATOMIZER_OFF')
+                "
+              />
+              <div class="toggle-track"></div>
+              <div class="toggle-thumb"></div>
+            </label>
+            <span class="relay-label" id="atomizerLabel">Off</span>
+          </div>
+        </div>
+        <div class="control-card">
+          <h3>Music player</h3>
+          <div class="cmd-btns">
+            <button class="cmd-btn primary" onclick="sendCommand('MUSIC_ON')">
+              Play
+            </button>
+            <button class="cmd-btn" onclick="sendCommand('MUSIC_OFF')">
+              Stop
+            </button>
+          </div>
+          <div style="font-size: 12px; color: var(--muted); margin-top: 12px">
+            <span class="dot" id="musicIndicator"></span>
+            <span id="musicLabel" style="margin-left: 8px">Stopped</span>
+          </div>
+        </div>
+        <div class="control-card">
+          <h3>Status</h3>
           <div class="cmd-btns">
             <button class="cmd-btn primary" onclick="sendCommand('STATUS')">
-              Refresh status
-            </button>
-            <button class="cmd-btn" onclick="sendCommand('LIGHTS_ON')">
-              Lights on
-            </button>
-            <button class="cmd-btn" onclick="sendCommand('LIGHTS_OFF')">
-              Lights off
+              Refresh all
             </button>
           </div>
         </div>
@@ -1017,6 +1043,35 @@
           roomText.textContent = "Empty";
           roomBadge.className = "badge emp";
           roomBadge.textContent = "empty";
+        }
+
+        // Light state from Firebase
+        if (data.light != null) {
+          const lightOn = data.light === "ON";
+          setRelay(lightOn);
+        }
+
+        // Atomizer state from Firebase
+        if (data.atomizer != null) {
+          const on = data.atomizer === "ON";
+          document.getElementById("atomizerToggle").checked = on;
+          document.getElementById("atomizerLabel").textContent = on
+            ? "On"
+            : "Off";
+        }
+
+        // Music state from Firebase
+        if (data.music != null) {
+          const playing = data.music === "PLAYING";
+          document.getElementById("musicLabel").textContent = playing
+            ? "Playing"
+            : "Stopped";
+          const indicator = document.getElementById("musicIndicator");
+          if (playing) {
+            indicator.className = "dot pulse";
+          } else {
+            indicator.className = "dot";
+          }
         }
       }
 

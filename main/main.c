@@ -58,6 +58,7 @@ static TickType_t fb_token_obtained_at = 0;
 
 static const char *TAG = "SmartHome";
 
+
 // ── Forward declarations ──────────────────────────────────────────────────────
 static void dfplayer_play(uint16_t track);
 static void dfplayer_stop(void);
@@ -124,7 +125,7 @@ static bool debounce_beam(int gpio, int *hi, int *lo, bool *broken)
 // ─────────────────────────────────────────────────────────────────────────────
 // Firebase HTTP helpers
 // ─────────────────────────────────────────────────────────────────────────────
-static char http_response_buf[2048];
+static char http_response_buf[8192];
 static int  http_response_len = 0;
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
@@ -142,9 +143,14 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+static esp_err_t http_discard_handler(esp_http_client_event_t *evt)
+{
+    return ESP_OK;
+}
+
 static bool firebase_signin_anonymous(void)
 {
-    char url[128];
+    char url[256];
     snprintf(url, sizeof(url),
         "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=%s",
         FIREBASE_API_KEY);
@@ -155,11 +161,11 @@ static bool firebase_signin_anonymous(void)
     http_response_buf[0] = '\0';
 
     esp_http_client_config_t cfg = {
-        .url                      = url,
-        .method                   = HTTP_METHOD_POST,
-        .skip_cert_common_name_check = true,
-        .event_handler            = http_event_handler,
-        .timeout_ms               = 20000,
+        .url            = url,
+        .method         = HTTP_METHOD_POST,
+        .event_handler  = http_event_handler,
+        .timeout_ms     = 20000,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -211,19 +217,15 @@ static void firebase_put(const char *path, const char *json)
     if ((xTaskGetTickCount() - fb_token_obtained_at) >= pdMS_TO_TICKS(TOKEN_REFRESH_INTERVAL_MS))
         firebase_signin_anonymous();
 
-    static char url[1400];
+    static char url[2048];
     snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
 
-    http_response_len = 0;
-    http_response_buf[0] = '\0';
-
     esp_http_client_config_t cfg = {
-        .url                 = url,
-        .method              = HTTP_METHOD_PUT,
-        .use_global_ca_store = true,
-        .event_handler       = http_event_handler,
-        .timeout_ms          = 15000,
-        .buffer_size_tx      = 1200,
+        .url            = url,
+        .method         = HTTP_METHOD_PUT,
+        .event_handler  = http_discard_handler,
+        .timeout_ms     = 15000,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -231,10 +233,11 @@ static void firebase_put(const char *path, const char *json)
     esp_http_client_set_post_field(client, json, strlen(json));
 
     esp_err_t err = esp_http_client_perform(client);
-    if (err != ESP_OK)
-        ESP_LOGW(TAG, "firebase_put(%s) failed: %s", path, esp_err_to_name(err));
-
+    int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status != 200)
+        ESP_LOGW(TAG, "firebase_put(%s) failed: %s (HTTP %d)", path, esp_err_to_name(err), status);
 }
 
 static bool firebase_get(const char *path, char *out_buf, int out_size)
@@ -242,19 +245,18 @@ static bool firebase_get(const char *path, char *out_buf, int out_size)
     if ((xTaskGetTickCount() - fb_token_obtained_at) >= pdMS_TO_TICKS(TOKEN_REFRESH_INTERVAL_MS))
         firebase_signin_anonymous();
 
-    static char url[1400];
+    static char url[2048];
     snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
 
     http_response_len = 0;
     http_response_buf[0] = '\0';
 
     esp_http_client_config_t cfg = {
-        .url                 = url,
-        .method              = HTTP_METHOD_GET,
-        .use_global_ca_store = true,
-        .event_handler       = http_event_handler,
-        .timeout_ms          = 15000,
-        .buffer_size_tx      = 1200,
+        .url            = url,
+        .method         = HTTP_METHOD_GET,
+        .event_handler  = http_event_handler,
+        .timeout_ms     = 15000,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -274,15 +276,15 @@ static bool firebase_get(const char *path, char *out_buf, int out_size)
 
 static void firebase_delete(const char *path)
 {
-    static char url[1400];
+    static char url[2048];
     snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
 
     esp_http_client_config_t cfg = {
-        .url                 = url,
-        .method              = HTTP_METHOD_DELETE,
-        .use_global_ca_store = true,
-        .timeout_ms          = 15000,
-        .buffer_size_tx      = 1200,
+        .url            = url,
+        .method         = HTTP_METHOD_DELETE,
+        .event_handler  = http_discard_handler,
+        .timeout_ms     = 15000,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
