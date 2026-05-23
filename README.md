@@ -1,36 +1,79 @@
-# Smart-Home-Control-System
+# Smart Home Control System (WiFi + Firebase)
 
-An embedded systems project that monitors room occupancy, temperature, and humidity, publishing all data over MQTT via WiFi. Built with ESP-IDF on an ESP32.
+A complete IoT smart home system built with ESP32 that monitors room occupancy, controls lighting/appliances, and manages an AC unit via IR remote. All data syncs with Firebase Realtime Database and is accessible via a responsive web dashboard.
+
+## Evolution: From MQTT to Firebase
+
+**Initial Approach (MQTT):**
+- Used Mosquitto MQTT broker running on a local laptop/mobile server
+- Required the mobile device to always be running the broker
+- Limited to local network access only
+- Dashboard had to be self-hosted
+- AC control feature was **not completed**
+
+**Current Approach (Firebase):**
+- Uses Firebase Realtime Database for cloud-based data sync
+- No local server needed — accessible from anywhere
+- Built-in web hosting for dashboard (Firebase Hosting)
+- Easier authentication and REST API
+- **AC control fully implemented as code only** with IR code capture and transmission
+- Scalable and production-ready
 
 ---
 
 ## System Overview
 
-The system uses two IR break beams and a PIR sensor at a door to detect entries and exits with directional awareness, and a DHT22 sensor to monitor ambient conditions. All data is published to an MQTT broker accessible from any device on the same network.
+The system combines multiple sensors and actuators:
+- **IR Break Beams + PIR**: Directional occupancy detection
+- **Web Dashboard**: Real-time monitoring and control from any device
+- **Firebase Sync**: Central data repository for all device state
+- **Device Control**: Lights (relay), atomizer, music player, and AC
+- **IR Transmission**: AC temperature control via RG56V2/BGEF remote
 
-### Detection Logic
+### Occupancy Detection
 
 ```
 ENTRANCE: outer beam breaks → inner beam breaks → PIR detects motion → count++
 EXIT:      inner beam breaks → outer beam breaks → count--
 ```
 
-- Both beams must break within **3 seconds** of each other, otherwise the event is discarded
-- A **2-second cooldown** applies after every detected entrance or exit
+- Both beams must break within **3 seconds** of each other
+- A **2-second cooldown** applies after every detection
 - Room is OCCUPIED when `count > 0`, EMPTY when `count == 0`
+- On entrance: lights ON, atomizer ON, music plays
+- On exit: lights OFF, atomizer OFF, music stops
+
+---
+
+## Features
+
+✅ **Occupancy Detection** – Directional IR + PIR sensor fusion
+✅ **Real-time Dashboard** – Control and monitor from web browser
+✅ **Firebase Integration** – All state synced to Realtime Database
+✅ **Device Control**:
+   - Lamp (active-LOW relay, GPIO23)
+   - Ultrasonic Atomizer (GPIO21)
+   - Music Player (DFPlayer, UART2)
+   - AC Unit (IR transmission, GPIO19)
+✅ **Automatic Sync** – Dashboard updates in real-time without page refresh
+ **AC Control** – Temperature slider 16–30°C via RG56V2/BGEF remote
+
 
 ---
 
 ## Hardware Components
 
-| Component | Purpose |
-|---|---|
-| ESP32 | Main microcontroller |
-| IR phototransistor × 2 | Break beam receivers (outer and inner) |
-| IR LED × 2 | Break beam transmitters (battery-powered, driven at 38 kHz) |
-| PIR sensor (HC-SR501) | Confirms entrance direction |
-| DHT22 / AM2302 | Temperature and humidity sensing |
-| Mosquitto | MQTT broker running on a laptop |
+| Component | Purpose | Pin |
+|---|---|---|
+| ESP32 | Main microcontroller | — |
+| IR Break Beam (outer) | Entry/exit detection | GPIO 13 |
+| IR Break Beam (inner) | Entry/exit detection | GPIO 14 |
+| PIR Sensor (HC-SR501) | Motion direction confirmation | GPIO 25 |
+| DHT22 / AM2302 | Temperature & humidity | GPIO 26 |
+| Relay Module | Light control | GPIO 23 (active LOW) |
+| Ultrasonic Atomizer | Mist control | GPIO 21 |
+| DFPlayer Mini | Music playback | UART2 (GPIO 17 TX) |
+| IR LED (transmitter) | AC remote control | GPIO 19 |
 
 ---
 
@@ -38,140 +81,280 @@ EXIT:      inner beam breaks → outer beam breaks → count--
 
 ### IR Break Beams
 
-The transmitters are powered independently from a battery and driven at **38 kHz** (use a second MCU or 555 timer). The receivers connect to the ESP32 as follows:
-
-**Outer receiver (GPIO 13) — outside the door:**
+**Outer (GPIO 13) — outside door:**
 ```
 3.3V ──[10kΩ]──┬── GPIO 13
-               Collector
-           (phototransistor)
-               Emitter
-               │
+               │ (phototransistor collector)
               GND
 ```
 
-**Inner receiver (GPIO 14) — inside the door:**
+**Inner (GPIO 14) — inside door:**
 ```
 3.3V ──[10kΩ]──┬── GPIO 14
-               Collector
-           (phototransistor)
-               Emitter
-               │
+               │ (phototransistor collector)
               GND
 ```
 
 ### PIR Sensor (GPIO 25)
-
 ```
-5V    ── PIR VCC
-GND   ── PIR GND
-GPIO 25 ── PIR OUT
+5V    ── VCC
+GND   ── GND
+GPIO 25 ── OUT
 ```
 
 ### DHT22 / AM2302 (GPIO 26)
-
 ```
-3.3V  ── DHT22 pin 1 (VCC)
-GPIO 26 ── DHT22 pin 2 (DATA)
-NC    ── DHT22 pin 3
-GND   ── DHT22 pin 4 (GND)
+3.3V  ── VCC
+GPIO 26 ── DATA (with 10kΩ pull-up to 3.3V if needed)
+GND   ── GND
 ```
 
-Add a **10 kΩ pull-up** between DATA and 3.3V if using the bare 4-pin DHT22. The pre-wired AM2302 (3-wire version) has it built in.
+### Relay (GPIO 23) — Active LOW
+```
+GPIO 23 ── IN1 (when LOW, relay energizes)
+5V ── JD-VCC
+GND ── GND
+```
+
+### Atomizer (GPIO 21)
+```
+GPIO 21 ── Control pin
+GND ── GND
+```
+
+### DFPlayer Mini (UART2)
+```
+GPIO 17 (TX) ── RX (via 1kΩ resistor or level shifter)
+GND ── GND
+5V  ── VCC (from separate power supply)
+```
+
+### IR Transmitter (GPIO 19)
+```
+GPIO 19 ── LED Anode (via ~470Ω current-limiting resistor)
+GND ── LED Cathode
+```
 
 ---
 
-## MQTT Topics
+## Firebase Setup
 
-| Topic | Values | Description |
-|---|---|---|
-| `smarthome/room001/room` | `OCCUPIED` / `EMPTY` | Room occupancy state |
-| `smarthome/room001/count` | Integer | Number of people currently in the room |
-| `smarthome/room001/temperature` | Float (°C) | Published every 5 seconds |
-| `smarthome/room001/humidity` | Float (%) | Published every 5 seconds |
-| `smarthome/room001/command` | `LIGHTS_ON` / `LIGHTS_OFF` / `STATUS` | Inbound commands |
+Before flashing, set up Firebase:
+
+1. **Create Firebase Project**
+   - Go to [console.firebase.google.com](https://console.firebase.google.com)
+   - Create new project (e.g., `embeddedpro-573f6`)
+
+2. **Enable Realtime Database**
+   - Create database in test mode (for development)
+   - Note the database URL: `https://<project>.firebaseio.com`
+
+3. **Get API Key**
+   - Go to Project Settings → Web API Key
+   - Copy the API key
+
+4. **Create `secrets.h`**
+   ```c
+   #define WIFI_SSID   "your-network-name"
+   #define WIFI_PASS   "your-wifi-password"
+   #define FIREBASE_HOST    "embeddedpro-573f6.firebaseio.com"
+   #define FIREBASE_API_KEY "YOUR_WEB_API_KEY_HERE"
+   ```
+
+### Firebase Database Structure
+```
+smarthome/room001/
+├── room       → "OCCUPIED" or "EMPTY"
+├── count      → number of people
+├── light      → "ON" or "OFF"
+├── atomizer   → "ON" or "OFF"
+├── music      → "PLAYING" or "STOPPED"
+├── temperature → °C (DHT22)
+├── humidity    → % (DHT22)
+└── command    → "LIGHTS_ON" / "LIGHTS_OFF" / "ATOMIZER_ON" / "ATOMIZER_OFF" / "MUSIC_ON" / "MUSIC_OFF" / "AC_SET_TEMP:XX" / "STATUS"
+```
+
+---
+
+## Dashboard
+
+The web dashboard (`dashboard.html`) is hosted on **Firebase Hosting** at:
+```
+https://embeddedpro-573f6.web.app
+```
+
+### Features
+- **Real-time Display**: Room status, people count, sensor readings
+- **Control Buttons**: Lights, Atomizer, Music (On/Off)
+- **AC Temperature Slider**: 16–30°C with +/– buttons
+- **Responsive Design**: Works on desktop and mobile
+- **Auto-refresh**: Updates every 3 seconds without user interaction
+
+### Deploying Dashboard
+```bash
+npm install -g firebase-tools
+firebase login
+firebase deploy --only hosting
+```
+
+---
+
+## AC Remote Control (In Progress)
+
+**Remote Model**: RG56V2/BGEF
+**Status**: Infrastructure ready, IR codes **pending capture** (not available in MQTT version)
+
+> **Note**: AC control was planned but never started in the MQTT version. Infrastructure is now implemented in Firebase, but actual IR codes from the RG56V2/BGEF remote still need to be captured.
+
+### How It Works
+1. Dashboard sends "AC_SET_TEMP:<temp>" to Firebase `/command` node
+2. ESP32 polls `/command` and parses the temperature
+3. ESP32 transmits corresponding IR code to AC via GPIO19
+4. AC adjusts temperature
+
+### Capturing IR Codes
+
+To get the actual IR codes from your remote:
+
+1. Set `IR_CAPTURE_ENABLED` to `1` in `main.c`:
+   ```c
+   #define IR_CAPTURE_ENABLED 1
+   ```
+
+2. Compile and upload:
+   ```bash
+   idf.py build
+   idf.py -p COM5 flash monitor
+   ```
+
+3. Open Serial Monitor (115200 baud)
+   You'll see: `=== IR CODE CAPTURE MODE ===`
+
+4. Point remote at ESP32's IR receiver (GPIO 13) and press buttons:
+   - Press 16°C button → note: `IR CODE: addr=0xXX cmd=0xYY`
+   - Press 17°C button → note: `IR CODE: addr=0xXX cmd=0xYY`
+   - Continue through 30°C
+
+5. Once collected, update `handle_ac_command()` in `main.c`:
+   ```c
+   static void handle_ac_command(int temp)
+   {
+       uint8_t cmd_codes[15] = {
+           0xXX, // 16°C
+           0xYY, // 17°C
+           // ... continue through 30°C
+       };
+       uint32_t cmd = cmd_codes[temp - 16];
+       send_ir_nec(0x01, cmd);
+   }
+   ```
+
+6. Disable capture mode:
+   ```c
+   #define IR_CAPTURE_ENABLED 0
+   ```
+
+7. Recompile and upload
 
 ---
 
 ## Configuration
 
-Before building, update these defines in [main/main.c](main/main.c):
+Update `secrets.h` with your credentials:
 
 ```c
-#define WIFI_SSID   "your-hotspot-name"
-#define WIFI_PASS   "your-password"
-#define MQTT_HOST   "broker-ip-address"   // your laptop's IP on the same network
-#define MQTT_USER   "admin"
-#define MQTT_PASS   "your-mqtt-password"
+#define WIFI_SSID        "your-ssid"
+#define WIFI_PASS        "your-password"
+#define FIREBASE_HOST    "your-project.firebaseio.com"
+#define FIREBASE_API_KEY "your-web-api-key"
 ```
-
-Find your laptop's IP with:
-```powershell
-ipconfig | findstr /i "IPv4"
-```
-
----
-
-## Environment Setup
-
-Activate the ESP-IDF environment before running any commands (once per terminal session):
-
-```powershell
-. "C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1"
-```
-
-Or launch **ESP-IDF v6.0.1 PowerShell** from the Start Menu.
-
-> `.vscode/settings.json` and `.vscode/c_cpp_properties.json` are not tracked by git — each developer configures them locally for their own machine.
-
----
-
-## MQTT Broker Setup (Mosquitto)
-
-Mosquitto must be running on the laptop before flashing. In an **Administrator** PowerShell:
-
-```powershell
-net start mosquitto
-```
-
-Verify it's listening:
-```powershell
-netstat -an | findstr "1883"
-```
-
-You should see `0.0.0.0:1883 LISTENING`.
 
 ---
 
 ## Building and Flashing
 
-Find your ESP32's COM port:
+Find your ESP32 COM port:
 ```powershell
-Get-PnpDevice -Class Ports | Where-Object Status -eq 'OK' | Select-Object FriendlyName
+Get-PnpDevice -Class Ports | Where-Object Status -eq 'OK'
 ```
 
-Flash and open the serial monitor:
-```powershell
+Build, flash, and monitor:
+```bash
 idf.py -p COM5 flash monitor
 ```
 
-Replace `COM5` with your actual port. Press **Ctrl+]** to exit the monitor.
-
-**Step by step if preferred:**
-```powershell
+Or step-by-step:
+```bash
 idf.py build
 idf.py -p COM5 flash
 idf.py -p COM5 monitor
 ```
 
+Press **Ctrl+]** to exit monitor.
+
 ---
 
-## Monitoring via MQTT Explorer
+## Serial Output
 
-1. Connect your phone or laptop to the **same WiFi network** as the ESP32
-2. Open [MQTT Explorer](https://mqtt-explorer.com) and connect:
-   - Host: your laptop's IP
-   - Port: `1883`
-   - Username: `admin`
-   - Password: *(as configured)*
-3. Subscribe to `smarthome/room001/#` to see all topics live
+### Startup
+```
+=== Smart Home — WiFi/Firebase build ===
+WiFi connected. IP: 192.168.1.100
+Firebase: anonymous sign-in OK
+Firebase ready — publishing enabled.
+System ready.
+```
+
+### Sensor Debug (every 2 seconds)
+```
+SENSORS: outer=1 inner=1 pir=0 | state=0
+```
+
+### Commands Received
+```
+Command received: LIGHTS_ON
+firebase_put(/smarthome/room001/light) = "ON" ✓
+```
+
+### IR Capture Mode
+```
+=== IR CODE CAPTURE MODE ===
+Press buttons on your remote — codes will be logged to serial
+IR CODE: addr=0x01 cmd=0x10
+```
+
+---
+
+## Troubleshooting
+
+| Issue | Solution |
+|---|---|
+| WiFi won't connect | Check SSID/password in `secrets.h`, verify WiFi 2.4GHz |
+| Dashboard shows "Unknown" | Check Firebase API Key, verify REST URL format |
+| No sensor data in Firebase | Verify Firebase anonymous sign-in succeeded in logs |
+| IR codes not capturing | Check GPIO13 connection, ensure remote is pointed correctly |
+| AC not responding | Capture IR codes and verify they match remote output |
+
+---
+
+## Implementation Status
+
+### Completed ✅
+- WiFi + Firebase Realtime Database integration
+- Occupancy detection (IR break beams + PIR sensor fusion)
+- Device control (lights, atomizer, music player)
+- Web dashboard with real-time sync
+- IR transmitter hardware setup (GPIO19)
+- IR code capture mode for remote learning
+- Command polling and parsing infrastructure
+
+### In Progress 🔄
+- **AC Remote Control**: Capture actual IR codes from RG56V2/BGEF remote (16–30°C)
+- Update `handle_ac_command()` with captured codes
+- Test complete AC control flow end-to-end
+
+### Future Enhancements
+- [ ] Deploy dashboard to Firebase Hosting
+- [ ] Fine-tune sensor debouncing parameters
+- [ ] Add temperature/humidity chart display to dashboard
+- [ ] Add scheduling/automation features
