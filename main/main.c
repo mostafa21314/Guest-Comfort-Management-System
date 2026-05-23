@@ -59,12 +59,22 @@ static TickType_t fb_token_obtained_at = 0;
 static const char *TAG = "SmartHome";
 
 
+// ── Detection event queue ─────────────────────────────────────────────────────
+typedef struct {
+    enum { EVT_ENTRY, EVT_EXIT, EVT_STATE_CHANGE } type;
+    int people_count;
+    bool room_occupied;
+} detection_event_t;
+
+static QueueHandle_t detection_queue = NULL;
+
 // ── Forward declarations ──────────────────────────────────────────────────────
 static void dfplayer_play(uint16_t track);
 static void dfplayer_stop(void);
 static void relay_set(bool on);
 static void atomizer_press(void);
 static void atomizer_set(bool on);
+static void network_task(void *arg);
 
 // ── Global state ──────────────────────────────────────────────────────────────
 static volatile bool room_occupied = false;
@@ -360,58 +370,6 @@ static void atomizer_set(bool on)
     pub_atomizer(on);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Command polling — called from the main loop every COMMAND_POLL_MS
-// ─────────────────────────────────────────────────────────────────────────────
-static void poll_command(void)
-{
-    if (!fb_ready) return;
-
-    char raw[128];
-    if (!firebase_get(PATH_COMMAND, raw, sizeof(raw))) return;
-
-    // Firebase returns JSON: "LIGHTS_ON" (with quotes) or null
-    if (strcmp(raw, "null") == 0 || strlen(raw) < 3) return;
-
-    // Strip surrounding quotes: "LIGHTS_ON" → LIGHTS_ON
-    char cmd[64] = {0};
-    int len = strlen(raw);
-    if (raw[0] == '"' && raw[len - 1] == '"') {
-        strncpy(cmd, raw + 1, len - 2);
-        cmd[len - 2] = '\0';
-    } else {
-        strncpy(cmd, raw, sizeof(cmd) - 1);
-    }
-
-    ESP_LOGI(TAG, "Command received: %s", cmd);
-
-    if (strcmp(cmd, "LIGHTS_ON") == 0) {
-        relay_set(true);
-    } else if (strcmp(cmd, "LIGHTS_OFF") == 0) {
-        relay_set(false);
-    } else if (strcmp(cmd, "ATOMIZER_ON") == 0) {
-        atomizer_set(true);
-    } else if (strcmp(cmd, "ATOMIZER_OFF") == 0) {
-        atomizer_set(false);
-    } else if (strcmp(cmd, "MUSIC_ON") == 0) {
-        dfplayer_play(1);
-        music_on = true;
-        pub_music(true);
-    } else if (strcmp(cmd, "MUSIC_OFF") == 0) {
-        dfplayer_stop();
-        music_on = false;
-        pub_music(false);
-    } else if (strcmp(cmd, "STATUS") == 0) {
-        pub_room(room_occupied ? "OCCUPIED" : "EMPTY");
-        pub_count(people_count);
-        pub_light(light_on);
-        pub_atomizer(atomizer_on);
-        pub_music(music_on);
-    }
-
-    // Clear the command node so it is not processed again
-    firebase_delete(PATH_COMMAND);
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Directional detection (IR + PIR)
@@ -468,16 +426,9 @@ static void detection_poll(void)
             } else if (outer_just_broke) {
                 // EXIT confirmed
                 people_count = (people_count > 0) ? people_count - 1 : 0;
-                pub_count(people_count);
-                if (people_count == 0 && room_occupied) {
-                    room_occupied = false;
-                    pub_room("EMPTY");
-                    relay_set(false);
-                    dfplayer_stop();
-                    music_on = false;
-                    pub_music(false);
-                    atomizer_set(false);
-                }
+                room_occupied = (people_count > 0);
+                detection_event_t evt = {.type = EVT_EXIT, .people_count = people_count, .room_occupied = room_occupied};
+                xQueueSend(detection_queue, &evt, 0);
                 ESP_LOGI(TAG, "<<< EXIT (people: %d)", people_count);
                 last_detection_at = now;
                 detect_state = DETECT_IDLE;
@@ -491,16 +442,9 @@ static void detection_poll(void)
             } else if (gpio_get_level(PIR_PIN) == 1) {
                 // ENTRANCE confirmed
                 people_count++;
-                pub_count(people_count);
-                if (!room_occupied) {
-                    room_occupied = true;
-                    pub_room("OCCUPIED");
-                    relay_set(true);
-                    atomizer_set(true);
-                    dfplayer_play(1);
-                    music_on = true;
-                    pub_music(true);
-                }
+                room_occupied = true;
+                detection_event_t evt = {.type = EVT_ENTRY, .people_count = people_count, .room_occupied = true};
+                xQueueSend(detection_queue, &evt, 0);
                 ESP_LOGI(TAG, ">>> ENTRANCE confirmed (People: %d)", people_count);
                 last_detection_at = now;
                 detect_state = DETECT_IDLE;
@@ -627,6 +571,81 @@ static void dfplayer_stop(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Network task — handles all Firebase I/O and state publishing
+// ─────────────────────────────────────────────────────────────────────────────
+static void network_task(void *arg)
+{
+    TickType_t last_cmd_poll = xTaskGetTickCount();
+    detection_event_t evt;
+
+    while (1) {
+        // Process detection events from the sensor polling task
+        if (xQueueReceive(detection_queue, &evt, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (evt.type == EVT_ENTRY) {
+                pub_room("OCCUPIED");
+                pub_count(evt.people_count);
+                relay_set(true);
+                atomizer_set(true);
+                dfplayer_play(1);
+                music_on = true;
+                pub_music(true);
+            } else if (evt.type == EVT_EXIT) {
+                if (!evt.room_occupied) {
+                    pub_room("EMPTY");
+                    relay_set(false);
+                    dfplayer_stop();
+                    music_on = false;
+                    pub_music(false);
+                    atomizer_set(false);
+                } else {
+                    pub_count(evt.people_count);
+                }
+            }
+        }
+
+        // Poll for Firebase commands every 3 seconds
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_cmd_poll) >= pdMS_TO_TICKS(COMMAND_POLL_MS)) {
+            if (fb_ready) {
+                char raw[128];
+                if (firebase_get(PATH_COMMAND, raw, sizeof(raw))) {
+                    if (strcmp(raw, "null") != 0 && strlen(raw) >= 3) {
+                        char cmd[64] = {0};
+                        int len = strlen(raw);
+                        if (raw[0] == '"' && raw[len - 1] == '"') {
+                            strncpy(cmd, raw + 1, len - 2);
+                            cmd[len - 2] = '\0';
+                        } else {
+                            strncpy(cmd, raw, sizeof(cmd) - 1);
+                        }
+
+                        ESP_LOGI(TAG, "Command received: %s", cmd);
+                        if (strcmp(cmd, "LIGHTS_ON") == 0) relay_set(true);
+                        else if (strcmp(cmd, "LIGHTS_OFF") == 0) relay_set(false);
+                        else if (strcmp(cmd, "ATOMIZER_ON") == 0) atomizer_set(true);
+                        else if (strcmp(cmd, "ATOMIZER_OFF") == 0) atomizer_set(false);
+                        else if (strcmp(cmd, "MUSIC_ON") == 0) { dfplayer_play(1); music_on = true; pub_music(true); }
+                        else if (strcmp(cmd, "MUSIC_OFF") == 0) { dfplayer_stop(); music_on = false; pub_music(false); }
+                        else if (strcmp(cmd, "STATUS") == 0) {
+                            pub_room(room_occupied ? "OCCUPIED" : "EMPTY");
+                            pub_count(people_count);
+                            pub_light(light_on);
+                            pub_atomizer(atomizer_on);
+                            pub_music(music_on);
+                        }
+
+                        firebase_delete(PATH_COMMAND);
+                    }
+                }
+            }
+            last_cmd_poll = now;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 void app_main(void)
@@ -700,18 +719,20 @@ void app_main(void)
 
     ESP_LOGI(TAG, "System ready.");
 
-    TickType_t last_cmd_poll = 0;
+    // Create detection event queue
+    detection_queue = xQueueCreate(10, sizeof(detection_event_t));
+    if (!detection_queue) {
+        ESP_LOGE(TAG, "Failed to create detection queue");
+        return;
+    }
+
+    // Spawn network task for Firebase I/O
+    xTaskCreate(network_task, "network_task", 4096, NULL, 5, NULL);
+    ESP_LOGI(TAG, "Network task spawned.");
+
+    // Main sensor polling loop — deterministic 10ms interval
     while (1) {
-        // Directional detection (IR + PIR) — every POLL_PERIOD_MS
         detection_poll();
-
-        // Command polling from Firebase — every COMMAND_POLL_MS
-        TickType_t now = xTaskGetTickCount();
-        if ((now - last_cmd_poll) >= pdMS_TO_TICKS(COMMAND_POLL_MS)) {
-            poll_command();
-            last_cmd_poll = now;
-        }
-
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
     }
 }
