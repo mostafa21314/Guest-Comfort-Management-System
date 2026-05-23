@@ -19,25 +19,22 @@
 #include "esp_rom_sys.h"
 #include "soc/gpio_reg.h"
 #include "secrets.h"
-// ── WiFi credentials ──────────────────────────────────────────────────────────
+
+// ── WiFi / Firebase config ────────────────────────────────────────────────────
 #define WIFI_MAX_RETRY  10
 
-// ── Firebase configuration ────────────────────────────────────────────────────
-// Replace these with your actual Firebase project values.
-// FIREBASE_HOST    : your Realtime Database URL (no trailing slash, no https://)
-// FIREBASE_API_KEY : your Web API key (used for anonymous sign-in via Identity Toolkit)
-#define FIREBASE_BASE     "/smarthome/room001"
-
-// ── Firebase anonymous-auth token state ──────────────────────────────────────
-static char fb_id_token[1200]         = {0};
+#define FIREBASE_BASE                "/smarthome/room001"
+static char       fb_id_token[1200] = {0};
 static TickType_t fb_token_obtained_at = 0;
-#define TOKEN_REFRESH_INTERVAL_MS  (55 * 60 * 1000)   // refresh every 55 min
+#define TOKEN_REFRESH_INTERVAL_MS    (55 * 60 * 1000)
 
-// ── Firebase paths ────────────────────────────────────────────────────────────
 #define PATH_TEMP       FIREBASE_BASE "/temperature.json"
 #define PATH_HUM        FIREBASE_BASE "/humidity.json"
 #define PATH_ROOM       FIREBASE_BASE "/room.json"
 #define PATH_COUNT      FIREBASE_BASE "/count.json"
+#define PATH_LIGHT      FIREBASE_BASE "/light.json"
+#define PATH_ATOMIZER   FIREBASE_BASE "/atomizer.json"
+#define PATH_MUSIC      FIREBASE_BASE "/music.json"
 #define PATH_COMMAND    FIREBASE_BASE "/command.json"
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
@@ -47,7 +44,7 @@ static TickType_t fb_token_obtained_at = 0;
 #define IR_INNER_PIN    GPIO_NUM_14   // inner receiver (inside the door)
 #define RELAY_PIN       GPIO_NUM_23   // relay IN1 — active LOW
 #define ATOMIZER_PIN    GPIO_NUM_21   // ultrasonic atomizer control (HIGH = on)
-#define DFPLAYER_TX_PIN GPIO_NUM_17   // ESP32 TX → DFPlayer RX (avoid GPIO 2 — strapping pin)
+#define DFPLAYER_TX_PIN GPIO_NUM_17   // ESP32 TX → DFPlayer RX
 #define DFPLAYER_UART   UART_NUM_2
 #define DFPLAYER_BAUD   9600
 
@@ -61,62 +58,27 @@ static TickType_t fb_token_obtained_at = 0;
 
 static const char *TAG = "SmartHome";
 
-// ── Firebase root CA (Google Trust Services) ──────────────────────────────────
-// This allows esp_http_client to verify the Firebase TLS certificate.
-// Update this cert if it expires (valid until ~2036).
-static const char FIREBASE_ROOT_CA[] =
-    "-----BEGIN CERTIFICATE-----\n"
-    "MIIDdTCCAl2gAwIBAgILBAAAAAABFUtaw5QwDQYJKoZIhvcNAQEFBQAwVzELMAkG\n"
-    "A1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExEDAOBgNVBAsTB1Jv\n"
-    "b3QgQ0ExGzAZBgNVBAMTEkdsb2JhbFNpZ24gUm9vdCBDQTAeFw05ODA5MDExMjAw\n"
-    "MDBaFw0yODAxMjgxMjAwMDBaMFcxCzAJBgNVBAYTAkJFMRkwFwYDVQQKExBHbG9i\n"
-    "YWxTaWduIG52LXNhMRAwDgYDVQQLEwdSb290IENBMRswGQYDVQQDExJHbG9iYWxT\n"
-    "aWduIFJvb3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDaDuaZ\n"
-    "jc6j40+Kfvvxi4Mla+pIH/EqsLmVEQS98GPR4mdmzxzdzxtIK+6NiY6arymAZavp\n"
-    "xy0Sy6scTHAHoT0KMM0VjU/43dSMUBUc71DuxC73/OlS8pF94G3VNTCOXkNz8kHp\n"
-    "1Wrjsok6Vjk4bwY8iGlbKk3Fp1S4bInMm/k8yuX9ifUSPJJ4ltbcdG6TRGHRjcdG\n"
-    "snUOhugZitVtbNV4FpWi6cgKOOvyJBNPc1STE4U6G7weNLWLBYy5d4ux2x8gkasJ\n"
-    "U26Qzns3dLlwR5EiUWMWea6xrkEmCMgZK9FGqkjWZCrXgzT/LCrBbBlDSgeF59N8\n"
-    "9iFo7+ryUp9/k5DPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8E\n"
-    "BTADAQH/MB0GA1UdDgQWBBRge2YaRQ2XyolQL30EzTSo//z9SzANBgkqhkiG9w0B\n"
-    "AQUFAAOCAQEA1nPnfE920I2/7LqivjTFKDK1fPxsnCwrvQmeU79rXqoRSLblCKOz\n"
-    "yj1hTdNGCbM+w6DjY1Ub8rrvrTnhQ7k4o+YviiY776BQVvnGCv04zcQLcFGUl5gE\n"
-    "38NflNUVyRRBnMRddWQVDf9VMOyGj/8N7yy5Y0b2qvzfvGn9LhJIZJrglfCm7ymP\n"
-    "AbEVtQwdpf5pLGkkeB6zpxxxYu7KyJesF12KwvhHhm4qxFYxldBniYUr+WymXUad\n"
-    "DKqC5JlR3XC321Y9YeRq4VzW9v493kHMB65jUr9TU/Qr6cf9tveCX4XSQRjbgbME\n"
-    "HMUfpIBvFSDJ3gyICh3WZlXi/EjJKSZp4A==\n"
-    "-----END CERTIFICATE-----\n";
 
-
-// Forward decls — DFPlayer helpers are defined further down so detection_poll() can call them.
+// ── Forward declarations ──────────────────────────────────────────────────────
 static void dfplayer_play(uint16_t track);
 static void dfplayer_stop(void);
-
-static void relay_set(bool on)
-{
-    // Most relay modules are active LOW: LOW = relay energized = lamp ON
-    gpio_set_level(RELAY_PIN, on ? 0 : 1);
-    ESP_LOGI("relay", "Lamp %s", on ? "ON" : "OFF");
-}
-
-// Atomizer behaves like a momentary push button: one HIGH pulse toggles its state.
-static void atomizer_press(void)
-{
-    gpio_set_level(ATOMIZER_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    gpio_set_level(ATOMIZER_PIN, 0);
-    ESP_LOGI("atomizer", "button pressed");
-}
-
-// ── WiFi ──────────────────────────────────────────────────────────────────────
-static EventGroupHandle_t wifi_event_group;
-#define WIFI_CONNECTED_BIT  BIT0
-#define WIFI_FAIL_BIT       BIT1
-static int wifi_retry_count = 0;
+static void relay_set(bool on);
+static void atomizer_press(void);
+static void atomizer_set(bool on);
 
 // ── Global state ──────────────────────────────────────────────────────────────
 static volatile bool room_occupied = false;
 static int           people_count  = 0;
+static bool          light_on      = false;
+static bool          atomizer_on   = false;
+static bool          music_on      = false;
+static bool          fb_ready      = false;   // set true after successful Firebase sign-in
+
+// ── WiFi state ───────────────────────────────────────────────────────────────
+static EventGroupHandle_t wifi_event_group;
+#define WIFI_CONNECTED_BIT  BIT0
+#define WIFI_FAIL_BIT       BIT1
+static int wifi_retry_count = 0;
 
 // ── Directional detection state machine ───────────────────────────────────────
 typedef enum {
@@ -133,58 +95,6 @@ static TickType_t     last_detection_at = 0;
 static bool outer_broken = false, inner_broken = false;
 static int  outer_hi = 0, outer_lo = 0;
 static int  inner_hi = 0, inner_lo = 0;
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DHT22 bit-bang driver (unchanged — timing-critical, no HAL)
-// ─────────────────────────────────────────────────────────────────────────────
-#define _DHT_BIT(p)   (1U << ((p) & 31U))
-#define DHT_READ(p)   (((REG_READ(GPIO_IN_REG))  >> (p)) & 1U)
-#define DHT_HIGH(p)   REG_WRITE(GPIO_OUT_W1TS_REG,  _DHT_BIT(p))
-#define DHT_LOW(p)    REG_WRITE(GPIO_OUT_W1TC_REG,  _DHT_BIT(p))
-#define DHT_OUTPUT(p) REG_WRITE(GPIO_ENABLE_W1TS_REG, _DHT_BIT(p))
-#define DHT_INPUT(p)  REG_WRITE(GPIO_ENABLE_W1TC_REG, _DHT_BIT(p))
-
-typedef struct { float temperature; float humidity; bool valid; } dht_data_t;
-
-static dht_data_t dht_read(int pin)
-{
-    dht_data_t result = {0.0f, 0.0f, false};
-    uint8_t data[5] = {0};
-
-    DHT_OUTPUT(pin); DHT_LOW(pin);
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    portDISABLE_INTERRUPTS();
-    DHT_HIGH(pin); esp_rom_delay_us(40); DHT_INPUT(pin);
-
-    int t = 0;
-    while (DHT_READ(pin) == 1) { esp_rom_delay_us(1); if (++t > 200) goto done; }
-    t = 0;
-    while (DHT_READ(pin) == 0) { esp_rom_delay_us(1); if (++t > 200) goto done; }
-    t = 0;
-    while (DHT_READ(pin) == 1) { esp_rom_delay_us(1); if (++t > 200) goto done; }
-
-    for (int i = 0; i < 40; i++) {
-        t = 0;
-        while (DHT_READ(pin) == 0) { esp_rom_delay_us(1); if (++t > 100) goto done; }
-        esp_rom_delay_us(35);
-        if (DHT_READ(pin) == 1) data[i / 8] |= (1U << (7 - (i % 8)));
-        t = 0;
-        while (DHT_READ(pin) == 1) { esp_rom_delay_us(1); if (++t > 150) goto done; }
-    }
-
-    if ((uint8_t)(data[0] + data[1] + data[2] + data[3]) != data[4]) goto done;
-    result.humidity    = ((data[0] << 8) | data[1]) * 0.1f;
-    result.temperature = (((data[2] & 0x7F) << 8) | data[3]) * 0.1f;
-    if (data[2] & 0x80) result.temperature = -result.temperature;
-    result.valid = true;
-
-done:
-    portENABLE_INTERRUPTS();
-    DHT_OUTPUT(pin); DHT_HIGH(pin);
-    return result;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // IR receivers
@@ -215,9 +125,7 @@ static bool debounce_beam(int gpio, int *hi, int *lo, bool *broken)
 // ─────────────────────────────────────────────────────────────────────────────
 // Firebase HTTP helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Shared response buffer — sized for the largest response (anonymous sign-in ~2 KB)
-static char http_response_buf[2048];
+static char http_response_buf[8192];
 static int  http_response_len = 0;
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
@@ -235,9 +143,14 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+static esp_err_t http_discard_handler(esp_http_client_event_t *evt)
+{
+    return ESP_OK;
+}
+
 static bool firebase_signin_anonymous(void)
 {
-    char url[128];
+    char url[256];
     snprintf(url, sizeof(url),
         "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=%s",
         FIREBASE_API_KEY);
@@ -248,16 +161,16 @@ static bool firebase_signin_anonymous(void)
     http_response_buf[0] = '\0';
 
     esp_http_client_config_t cfg = {
-        .url           = url,
-        .method        = HTTP_METHOD_POST,
-        .cert_pem      = FIREBASE_ROOT_CA,
-        .event_handler = http_event_handler,
-        .timeout_ms    = 10000,
+        .url            = url,
+        .method         = HTTP_METHOD_POST,
+        .event_handler  = http_event_handler,
+        .timeout_ms     = 20000,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Accept-Encoding", "identity"); // force plain JSON, no gzip
+    esp_http_client_set_header(client, "Accept-Encoding", "identity");
     esp_http_client_set_post_field(client, body, strlen(body));
     esp_err_t err = esp_http_client_perform(client);
     int status    = esp_http_client_get_status_code(client);
@@ -281,7 +194,7 @@ static bool firebase_signin_anonymous(void)
         ESP_LOGE(TAG, "Sign-in: unexpected char after idToken colon: 0x%02x", (unsigned char)*p);
         return false;
     }
-    p++; // skip opening quote
+    p++;
     char *end = strchr(p, '"');
     if (!end) {
         ESP_LOGE(TAG, "Sign-in: idToken closing quote missing — response truncated?");
@@ -294,35 +207,22 @@ static bool firebase_signin_anonymous(void)
     }
     strncpy(fb_id_token, p, len);
     fb_id_token[len] = '\0';
-
     fb_token_obtained_at = xTaskGetTickCount();
     ESP_LOGI(TAG, "Firebase: anonymous sign-in OK (token %d bytes).", len);
     return true;
 }
 
-/**
- * firebase_put() — writes a JSON value to a Firebase path via HTTP PATCH.
- * Using PATCH on the specific leaf node (e.g. /temperature.json) is equivalent
- * to a targeted PUT but avoids overwriting sibling nodes.
- *
- * @param path   e.g. "/smarthome/room001/temperature.json"
- * @param json   e.g. "24.5"  or  "\"OCCUPIED\""
- */
 static void firebase_put(const char *path, const char *json)
 {
-    if ((xTaskGetTickCount() - fb_token_obtained_at) >= pdMS_TO_TICKS(TOKEN_REFRESH_INTERVAL_MS))
-        firebase_signin_anonymous();
-
-    static char url[1400];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
+    static char url[512];
+    snprintf(url, sizeof(url), "https://%s%s?key=%s", FIREBASE_HOST, path, FIREBASE_API_KEY);
 
     esp_http_client_config_t cfg = {
         .url            = url,
         .method         = HTTP_METHOD_PUT,
-        .cert_pem       = FIREBASE_ROOT_CA,
-        .event_handler  = http_event_handler,
-        .timeout_ms     = 8000,
-        .buffer_size_tx = 1200,
+        .event_handler  = http_discard_handler,
+        .timeout_ms     = 15000,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -330,24 +230,20 @@ static void firebase_put(const char *path, const char *json)
     esp_http_client_set_post_field(client, json, strlen(json));
 
     esp_err_t err = esp_http_client_perform(client);
-    if (err != ESP_OK)
-        ESP_LOGW(TAG, "firebase_put(%s) failed: %s", path, esp_err_to_name(err));
-
+    int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+
+    if (err == ESP_OK && status == 200) {
+        ESP_LOGI(TAG, "firebase_put(%s) = %s ✓", path, json);
+    } else {
+        ESP_LOGW(TAG, "firebase_put(%s) failed: %s (HTTP %d)", path, esp_err_to_name(err), status);
+    }
 }
 
-/**
- * firebase_get() — reads a value from a Firebase path.
- * Stores the raw JSON response in out_buf (null-terminated).
- * Returns true on HTTP 200, false otherwise.
- */
 static bool firebase_get(const char *path, char *out_buf, int out_size)
 {
-    if ((xTaskGetTickCount() - fb_token_obtained_at) >= pdMS_TO_TICKS(TOKEN_REFRESH_INTERVAL_MS))
-        firebase_signin_anonymous();
-
-    static char url[1400];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
+    static char url[512];
+    snprintf(url, sizeof(url), "https://%s%s?key=%s", FIREBASE_HOST, path, FIREBASE_API_KEY);
 
     http_response_len = 0;
     http_response_buf[0] = '\0';
@@ -355,10 +251,9 @@ static bool firebase_get(const char *path, char *out_buf, int out_size)
     esp_http_client_config_t cfg = {
         .url            = url,
         .method         = HTTP_METHOD_GET,
-        .cert_pem       = FIREBASE_ROOT_CA,
         .event_handler  = http_event_handler,
-        .timeout_ms     = 8000,
-        .buffer_size_tx = 1200,
+        .timeout_ms     = 15000,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -367,29 +262,29 @@ static bool firebase_get(const char *path, char *out_buf, int out_size)
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK || status != 200) {
-        ESP_LOGW(TAG, "firebase_get(%s) failed (status %d)", path, status);
+        ESP_LOGW(TAG, "firebase_get(%s) failed: %s (HTTP %d)", path, esp_err_to_name(err), status);
         return false;
     }
 
     strncpy(out_buf, http_response_buf, out_size - 1);
     out_buf[out_size - 1] = '\0';
+    if (strlen(out_buf) > 0 && strcmp(out_buf, "null") != 0) {
+        ESP_LOGI(TAG, "firebase_get(%s) = %s", path, out_buf);
+    }
     return true;
 }
 
-/**
- * firebase_delete() — sets a node to null (clears a command after processing).
- */
 static void firebase_delete(const char *path)
 {
-    static char url[1400];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
+    static char url[512];
+    snprintf(url, sizeof(url), "https://%s%s?key=%s", FIREBASE_HOST, path, FIREBASE_API_KEY);
 
     esp_http_client_config_t cfg = {
         .url            = url,
         .method         = HTTP_METHOD_DELETE,
-        .cert_pem       = FIREBASE_ROOT_CA,
-        .timeout_ms     = 8000,
-        .buffer_size_tx = 1200,
+        .event_handler  = http_discard_handler,
+        .timeout_ms     = 15000,
+        .buffer_size_tx = 2048,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -398,25 +293,11 @@ static void firebase_delete(const char *path)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Firebase publish helpers (thin wrappers for clean call sites)
+// Firebase publish helpers — all guard against pre-sign-in calls
 // ─────────────────────────────────────────────────────────────────────────────
-static void pub_temperature(float t)
-{
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.1f", t);
-    firebase_put(PATH_TEMP, buf);
-}
-
-static void pub_humidity(float h)
-{
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.1f", h);
-    firebase_put(PATH_HUM, buf);
-}
-
 static void pub_room(const char *status)
 {
-    // Firebase string values must be quoted JSON strings
+    if (!fb_ready) return;
     char buf[32];
     snprintf(buf, sizeof(buf), "\"%s\"", status);
     firebase_put(PATH_ROOM, buf);
@@ -424,9 +305,59 @@ static void pub_room(const char *status)
 
 static void pub_count(int count)
 {
+    if (!fb_ready) return;
     char buf[12];
     snprintf(buf, sizeof(buf), "%d", count);
     firebase_put(PATH_COUNT, buf);
+}
+
+static void pub_light(bool on)
+{
+    if (!fb_ready) return;
+    firebase_put(PATH_LIGHT, on ? "\"ON\"" : "\"OFF\"");
+}
+
+static void pub_atomizer(bool on)
+{
+    if (!fb_ready) return;
+    firebase_put(PATH_ATOMIZER, on ? "\"ON\"" : "\"OFF\"");
+}
+
+static void pub_music(bool on)
+{
+    if (!fb_ready) return;
+    firebase_put(PATH_MUSIC, on ? "\"PLAYING\"" : "\"STOPPED\"");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hardware control — defined after pub_* so they can publish state changes
+// ─────────────────────────────────────────────────────────────────────────────
+static void relay_set(bool on)
+{
+    // Active LOW relay: LOW = energised = lamp ON
+    gpio_set_level(RELAY_PIN, on ? 0 : 1);
+    light_on = on;
+    pub_light(on);
+    ESP_LOGI("relay", "Lamp %s", on ? "ON" : "OFF");
+}
+
+// Low-level toggle pulse — call atomizer_set() for state-aware control
+static void atomizer_press(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(200));
+    gpio_set_level(ATOMIZER_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    gpio_set_level(ATOMIZER_PIN, 0);
+    ESP_LOGI("atomizer", "button pressed");
+}
+
+// State-aware toggle: only pulses if actual state differs from desired state
+static void atomizer_set(bool on)
+{
+    if (on == atomizer_on) return;
+    atomizer_press();
+    atomizer_on = on;
+    pub_atomizer(on);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -434,6 +365,8 @@ static void pub_count(int count)
 // ─────────────────────────────────────────────────────────────────────────────
 static void poll_command(void)
 {
+    if (!fb_ready) return;
+
     char raw[128];
     if (!firebase_get(PATH_COMMAND, raw, sizeof(raw))) return;
 
@@ -456,21 +389,48 @@ static void poll_command(void)
         relay_set(true);
     } else if (strcmp(cmd, "LIGHTS_OFF") == 0) {
         relay_set(false);
+    } else if (strcmp(cmd, "ATOMIZER_ON") == 0) {
+        atomizer_set(true);
+    } else if (strcmp(cmd, "ATOMIZER_OFF") == 0) {
+        atomizer_set(false);
+    } else if (strcmp(cmd, "MUSIC_ON") == 0) {
+        dfplayer_play(1);
+        music_on = true;
+        pub_music(true);
+    } else if (strcmp(cmd, "MUSIC_OFF") == 0) {
+        dfplayer_stop();
+        music_on = false;
+        pub_music(false);
     } else if (strcmp(cmd, "STATUS") == 0) {
         pub_room(room_occupied ? "OCCUPIED" : "EMPTY");
         pub_count(people_count);
+        pub_light(light_on);
+        pub_atomizer(atomizer_on);
+        pub_music(music_on);
     }
 
-    // Clear the command node so it isn't processed again
+    // Clear the command node so it is not processed again
     firebase_delete(PATH_COMMAND);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Directional detection (unchanged logic — timing stays on-device)
+// Directional detection (IR + PIR)
 // ─────────────────────────────────────────────────────────────────────────────
 static void detection_poll(void)
 {
+    static TickType_t last_debug = 0;
     TickType_t now = xTaskGetTickCount();
+
+    // Debug: log sensor states every 2 seconds
+    if ((now - last_debug) >= pdMS_TO_TICKS(2000)) {
+        int outer_level = gpio_get_level(IR_OUTER_PIN);
+        int inner_level = gpio_get_level(IR_INNER_PIN);
+        int pir_level = gpio_get_level(PIR_PIN);
+        ESP_LOGI(TAG, "SENSORS: outer=%d inner=%d pir=%d | state=%d",
+                 outer_level, inner_level, pir_level, detect_state);
+        last_debug = now;
+    }
+
     if ((now - last_detection_at) < pdMS_TO_TICKS(COOLDOWN_MS)) return;
 
     bool outer_just_broke = debounce_beam(IR_OUTER_PIN, &outer_hi, &outer_lo, &outer_broken);
@@ -492,6 +452,7 @@ static void detection_poll(void)
 
         case DETECT_OUTER_FIRST:
             if ((now - state_entered_at) >= pdMS_TO_TICKS(SEQUENCE_TIMEOUT_MS)) {
+                ESP_LOGI(TAG, "Outer-first timeout — sequence abandoned");
                 detect_state = DETECT_IDLE;
             } else if (inner_just_broke) {
                 detect_state = DETECT_AWAIT_PIR;
@@ -502,6 +463,7 @@ static void detection_poll(void)
 
         case DETECT_INNER_FIRST:
             if ((now - state_entered_at) >= pdMS_TO_TICKS(SEQUENCE_TIMEOUT_MS)) {
+                ESP_LOGI(TAG, "Inner-first timeout — sequence abandoned");
                 detect_state = DETECT_IDLE;
             } else if (outer_just_broke) {
                 // EXIT confirmed
@@ -511,8 +473,10 @@ static void detection_poll(void)
                     room_occupied = false;
                     pub_room("EMPTY");
                     relay_set(false);
-                    atomizer_press();   // toggle atomizer OFF
-                    dfplayer_stop();    // silence welcome track
+                    dfplayer_stop();
+                    music_on = false;
+                    pub_music(false);
+                    atomizer_set(false);
                 }
                 ESP_LOGI(TAG, "<<< EXIT (people: %d)", people_count);
                 last_detection_at = now;
@@ -532,10 +496,12 @@ static void detection_poll(void)
                     room_occupied = true;
                     pub_room("OCCUPIED");
                     relay_set(true);
-                    atomizer_press();   // toggle atomizer ON
-                    dfplayer_play(1);   // welcome track
+                    atomizer_set(true);
+                    dfplayer_play(1);
+                    music_on = true;
+                    pub_music(true);
                 }
-                ESP_LOGI(TAG, ">>> ENTRANCE confirmed (people: %d)", people_count);
+                ESP_LOGI(TAG, ">>> ENTRANCE confirmed (People: %d)", people_count);
                 last_detection_at = now;
                 detect_state = DETECT_IDLE;
             }
@@ -588,13 +554,18 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    xEventGroupWaitBits(wifi_event_group,
-                        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                        pdFALSE, pdFALSE, portMAX_DELAY);
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE, pdFALSE, portMAX_DELAY);
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi connected successfully.");
+    } else {
+        ESP_LOGE(TAG, "WiFi failed to connect after %d retries.", WIFI_MAX_RETRY);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DFPlayer Mini — one-way UART control (ESP32 TX only; RX of module not used)
+// DFPlayer Mini — one-way UART control (ESP32 TX only)
 // Protocol: 10-byte frame  7E FF 06 CMD 00 paramH paramL checkH checkL EF
 // Checksum = 0 - sum(bytes 1..6) as a 16-bit value.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -605,7 +576,7 @@ static void dfplayer_send_cmd(uint8_t cmd, uint16_t param)
     f[1] = 0xFF;
     f[2] = 0x06;
     f[3] = cmd;
-    f[4] = 0x00;                       // no feedback requested
+    f[4] = 0x00;
     f[5] = (param >> 8) & 0xFF;
     f[6] = param & 0xFF;
     uint16_t sum = 0;
@@ -631,7 +602,7 @@ static void dfplayer_init(void)
     ESP_ERROR_CHECK(uart_param_config(DFPLAYER_UART, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(DFPLAYER_UART,
                                  DFPLAYER_TX_PIN,
-                                 UART_PIN_NO_CHANGE,    // RX unused
+                                 UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE,
                                  UART_PIN_NO_CHANGE));
 
@@ -643,9 +614,6 @@ static void dfplayer_init(void)
              DFPLAYER_UART, DFPLAYER_TX_PIN);
 }
 
-// Play the Nth file in physical write order on the SD root
-// (i.e. the first MP3 you copied is track 1). Use 0x12 + folder "mp3/0001.mp3"
-// instead if you want index-by-filename behavior.
 static void dfplayer_play(uint16_t track)
 {
     dfplayer_send_cmd(0x03, track);
@@ -671,7 +639,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Relay — lamp OFF at boot
+    // Relay — lamp OFF at boot (active LOW: HIGH = OFF)
     gpio_config_t relay_cfg = {
         .pin_bit_mask = (1ULL << RELAY_PIN),
         .mode         = GPIO_MODE_OUTPUT,
@@ -680,9 +648,9 @@ void app_main(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&relay_cfg);
-    relay_set(false);
+    gpio_set_level(RELAY_PIN, 1);   // active LOW — HIGH = OFF
 
-    // Atomizer — assumed OFF at boot, pulses toggle its state
+    // Atomizer — OFF at boot
     gpio_config_t atomizer_cfg = {
         .pin_bit_mask = (1ULL << ATOMIZER_PIN),
         .mode         = GPIO_MODE_OUTPUT,
@@ -703,50 +671,45 @@ void app_main(void)
     };
     gpio_config(&pir_cfg);
 
-    // DHT22
-    gpio_set_pull_mode(DHT_PIN, GPIO_PULLUP_ONLY);
-    DHT_OUTPUT(DHT_PIN);
-    DHT_HIGH(DHT_PIN);
-
     // IR
     ir_init();
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    ESP_LOGI(TAG, "=== Smart Home — Firebase REST ===");
-    wifi_init();
-    esp_wifi_set_ps(WIFI_PS_NONE);   // disable radio sleep — prevents TLS timeout failures
-    firebase_signin_anonymous();
+    ESP_LOGI(TAG, "=== Smart Home — WiFi/Firebase build ===");
+
+    // DFPlayer (needs ~2 s startup before accepting commands)
     dfplayer_init();
+
+    // WiFi (blocks until connected or WIFI_MAX_RETRY exhausted)
+    wifi_init();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // Firebase anonymous sign-in
+    if (firebase_signin_anonymous()) {
+        fb_ready = true;
+        // Publish boot state so the dashboard shows real values immediately
+        pub_room("EMPTY");
+        pub_count(0);
+        pub_light(false);
+        pub_atomizer(false);
+        pub_music(false);
+        ESP_LOGI(TAG, "Firebase ready — publishing enabled.");
+    } else {
+        ESP_LOGE(TAG, "Firebase auth failed — publishing and commands disabled.");
+    }
+
     ESP_LOGI(TAG, "System ready.");
 
-    TickType_t last_dht_tick     = xTaskGetTickCount();
-    TickType_t last_command_tick = xTaskGetTickCount();
-
+    TickType_t last_cmd_poll = 0;
     while (1) {
-        TickType_t now = xTaskGetTickCount();
-
-        // ── Directional detection (IR + PIR) — every POLL_PERIOD_MS ──────────
+        // Directional detection (IR + PIR) — every POLL_PERIOD_MS
         detection_poll();
 
-        // ── DHT22 — every DHT_INTERVAL_MS ─────────────────────────────────────
-        if ((now - last_dht_tick) >= pdMS_TO_TICKS(DHT_INTERVAL_MS)) {
-            last_dht_tick = now;
-            dht_data_t dht = dht_read(DHT_PIN);
-            if (dht.valid) {
-                pub_temperature(dht.temperature);
-                pub_humidity(dht.humidity);
-                ESP_LOGI(TAG, "Temp: %.1f C | Hum: %.1f %% | Room: %s | Count: %d",
-                         dht.temperature, dht.humidity,
-                         room_occupied ? "OCCUPIED" : "EMPTY", people_count);
-            } else {
-                ESP_LOGW(TAG, "DHT22 read failed (check wiring on GPIO %d)", DHT_PIN);
-            }
-        }
-
-        // ── Command polling — every COMMAND_POLL_MS ───────────────────────────
-        if ((now - last_command_tick) >= pdMS_TO_TICKS(COMMAND_POLL_MS)) {
-            last_command_tick = now;
+        // Command polling from Firebase — every COMMAND_POLL_MS
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_cmd_poll) >= pdMS_TO_TICKS(COMMAND_POLL_MS)) {
             poll_command();
+            last_cmd_poll = now;
         }
 
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
