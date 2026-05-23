@@ -214,11 +214,8 @@ static bool firebase_signin_anonymous(void)
 
 static void firebase_put(const char *path, const char *json)
 {
-    if ((xTaskGetTickCount() - fb_token_obtained_at) >= pdMS_TO_TICKS(TOKEN_REFRESH_INTERVAL_MS))
-        firebase_signin_anonymous();
-
-    static char url[2048];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
+    static char url[512];
+    snprintf(url, sizeof(url), "https://%s%s?key=%s", FIREBASE_HOST, path, FIREBASE_API_KEY);
 
     esp_http_client_config_t cfg = {
         .url            = url,
@@ -236,17 +233,17 @@ static void firebase_put(const char *path, const char *json)
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
-    if (err != ESP_OK || status != 200)
+    if (err == ESP_OK && status == 200) {
+        ESP_LOGI(TAG, "firebase_put(%s) = %s ✓", path, json);
+    } else {
         ESP_LOGW(TAG, "firebase_put(%s) failed: %s (HTTP %d)", path, esp_err_to_name(err), status);
+    }
 }
 
 static bool firebase_get(const char *path, char *out_buf, int out_size)
 {
-    if ((xTaskGetTickCount() - fb_token_obtained_at) >= pdMS_TO_TICKS(TOKEN_REFRESH_INTERVAL_MS))
-        firebase_signin_anonymous();
-
-    static char url[2048];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
+    static char url[512];
+    snprintf(url, sizeof(url), "https://%s%s?key=%s", FIREBASE_HOST, path, FIREBASE_API_KEY);
 
     http_response_len = 0;
     http_response_buf[0] = '\0';
@@ -265,19 +262,22 @@ static bool firebase_get(const char *path, char *out_buf, int out_size)
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK || status != 200) {
-        ESP_LOGW(TAG, "firebase_get(%s) failed (status %d)", path, status);
+        ESP_LOGW(TAG, "firebase_get(%s) failed: %s (HTTP %d)", path, esp_err_to_name(err), status);
         return false;
     }
 
     strncpy(out_buf, http_response_buf, out_size - 1);
     out_buf[out_size - 1] = '\0';
+    if (strlen(out_buf) > 0 && strcmp(out_buf, "null") != 0) {
+        ESP_LOGI(TAG, "firebase_get(%s) = %s", path, out_buf);
+    }
     return true;
 }
 
 static void firebase_delete(const char *path)
 {
-    static char url[2048];
-    snprintf(url, sizeof(url), "https://%s%s?auth=%s", FIREBASE_HOST, path, fb_id_token);
+    static char url[512];
+    snprintf(url, sizeof(url), "https://%s%s?key=%s", FIREBASE_HOST, path, FIREBASE_API_KEY);
 
     esp_http_client_config_t cfg = {
         .url            = url,
@@ -418,7 +418,19 @@ static void poll_command(void)
 // ─────────────────────────────────────────────────────────────────────────────
 static void detection_poll(void)
 {
+    static TickType_t last_debug = 0;
     TickType_t now = xTaskGetTickCount();
+
+    // Debug: log sensor states every 2 seconds
+    if ((now - last_debug) >= pdMS_TO_TICKS(2000)) {
+        int outer_level = gpio_get_level(IR_OUTER_PIN);
+        int inner_level = gpio_get_level(IR_INNER_PIN);
+        int pir_level = gpio_get_level(PIR_PIN);
+        ESP_LOGI(TAG, "SENSORS: outer=%d inner=%d pir=%d | state=%d",
+                 outer_level, inner_level, pir_level, detect_state);
+        last_debug = now;
+    }
+
     if ((now - last_detection_at) < pdMS_TO_TICKS(COOLDOWN_MS)) return;
 
     bool outer_just_broke = debounce_beam(IR_OUTER_PIN, &outer_hi, &outer_lo, &outer_broken);

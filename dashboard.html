@@ -649,9 +649,8 @@
     </header>
 
     <main>
-      <!-- Config -->
-      <p class="section-label">Firebase configuration</p>
-      <div class="config-card">
+      <!-- Config (hidden from UI) -->
+      <div class="config-card" style="display: none">
         <div class="config-grid">
           <div class="field full">
             <label>Realtime Database URL</label>
@@ -687,9 +686,6 @@
             <input type="number" id="fbPoll" value="3000" min="1000" />
           </div>
         </div>
-        <button class="btn-connect" id="btnConnect" onclick="startPolling()">
-          Connect
-        </button>
       </div>
 
       <!-- Room banner -->
@@ -778,36 +774,33 @@
       <div class="controls-row">
         <div class="control-card">
           <h3>Lamp relay</h3>
-          <div class="relay-toggle">
-            <label class="toggle-switch">
-              <input
-                type="checkbox"
-                id="relayToggle"
-                onchange="
-                  sendCommand(this.checked ? 'LIGHTS_ON' : 'LIGHTS_OFF')
-                "
-              />
-              <div class="toggle-track"></div>
-              <div class="toggle-thumb"></div>
-            </label>
-            <span class="relay-label" id="relayLabel">Off</span>
+          <div class="cmd-btns">
+            <button class="cmd-btn primary" onclick="sendCommand('LIGHTS_ON')">
+              On
+            </button>
+            <button class="cmd-btn" onclick="sendCommand('LIGHTS_OFF')">
+              Off
+            </button>
+          </div>
+          <div style="font-size: 12px; color: var(--muted); margin-top: 12px">
+            <span id="lightLabel">Off</span>
           </div>
         </div>
         <div class="control-card">
           <h3>Atomizer</h3>
-          <div class="relay-toggle">
-            <label class="toggle-switch">
-              <input
-                type="checkbox"
-                id="atomizerToggle"
-                onchange="
-                  sendCommand(this.checked ? 'ATOMIZER_ON' : 'ATOMIZER_OFF')
-                "
-              />
-              <div class="toggle-track"></div>
-              <div class="toggle-thumb"></div>
-            </label>
-            <span class="relay-label" id="atomizerLabel">Off</span>
+          <div class="cmd-btns">
+            <button
+              class="cmd-btn primary"
+              onclick="sendCommand('ATOMIZER_ON')"
+            >
+              On
+            </button>
+            <button class="cmd-btn" onclick="sendCommand('ATOMIZER_OFF')">
+              Off
+            </button>
+          </div>
+          <div style="font-size: 12px; color: var(--muted); margin-top: 12px">
+            <span id="atomizerLabel">Off</span>
           </div>
         </div>
         <div class="control-card">
@@ -926,18 +919,11 @@
         }
       }
 
-      async function ensureToken() {
-        const auth = document.getElementById("fbAuth").value.trim();
-        if (auth && Date.now() < idTokenExpiry) return true;
-        return await signInAnonymous();
-      }
-
       function fbUrl(path) {
         const host = document.getElementById("fbHost").value.trim();
-        const auth = document.getElementById("fbAuth").value.trim();
+        const apiKey = document.getElementById("fbApiKey").value.trim();
         const base = document.getElementById("fbPath").value.trim();
-        const query = auth ? "?auth=" + auth : "";
-        return "https://" + host + base + path + query;
+        return "https://" + host + base + path + "?key=" + apiKey;
       }
 
       async function fbGet(path) {
@@ -963,30 +949,26 @@
 
       async function startPolling() {
         const host = document.getElementById("fbHost").value.trim();
-        if (!host) {
-          showToast("Enter your Firebase Realtime Database host.");
+        const apiKey = document.getElementById("fbApiKey").value.trim();
+        if (!host || !apiKey) {
+          showToast("Firebase configuration incomplete.");
           return;
         }
-        const ok = await ensureToken();
-        if (!ok) return;
         if (pollTimer) clearInterval(pollTimer);
         const interval =
           parseInt(document.getElementById("fbPoll").value) || 3000;
-        document.getElementById("btnConnect").disabled = true;
-        document.getElementById("btnConnect").textContent = "Connected";
         poll();
         pollTimer = setInterval(poll, interval);
       }
 
       async function poll() {
         try {
-          await ensureToken();
           const data = await fbGet(".json");
           setConnected(true);
           applyData(data);
         } catch (e) {
           setConnected(false);
-          showToast("Firebase error: " + e.message);
+          console.error("Firebase error:", e.message);
         }
       }
 
@@ -1048,13 +1030,14 @@
         // Light state from Firebase
         if (data.light != null) {
           const lightOn = data.light === "ON";
-          setRelay(lightOn);
+          document.getElementById("lightLabel").textContent = lightOn
+            ? "On"
+            : "Off";
         }
 
         // Atomizer state from Firebase
         if (data.atomizer != null) {
           const on = data.atomizer === "ON";
-          document.getElementById("atomizerToggle").checked = on;
           document.getElementById("atomizerLabel").textContent = on
             ? "On"
             : "Off";
@@ -1079,17 +1062,9 @@
         try {
           await fbPut("/command.json", cmd);
           addLog("cmd", "Command sent: " + cmd);
-          if (cmd === "LIGHTS_ON") setRelay(true);
-          if (cmd === "LIGHTS_OFF") setRelay(false);
         } catch (e) {
           showToast("Failed to send command: " + e.message);
         }
-      }
-
-      function setRelay(on) {
-        relayState = on;
-        document.getElementById("relayToggle").checked = on;
-        document.getElementById("relayLabel").textContent = on ? "On" : "Off";
       }
 
       function setConnected(ok) {
@@ -1149,6 +1124,11 @@
 
       // Init slider fill on load
       updateSliderFill();
+
+      // Auto-connect to Firebase on page load
+      window.addEventListener("load", () => {
+        startPolling();
+      });
     </script>
   </body>
 </html>
